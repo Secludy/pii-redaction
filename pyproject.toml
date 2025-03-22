@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pii-redaction"
+version = "0.1.0"
+description = "A tool for redacting PII information from text using LLMs"
+readme = "README.md"
+authors = [
+    {name = "Andie Jones", email = "andie@openpipe.ai"},
+]
+requires-python = ">=3.7"
+license = {text = "MIT License"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch>=1.10.0",
+    "transformers>=4.26.0",
+    "tqdm>=4.61.0",
+    "faker>=8.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/OpenPipe/pii-redaction"
+
+[project.scripts]
+pii-redact = "pii_redaction.cli:main"
