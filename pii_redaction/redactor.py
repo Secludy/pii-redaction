@@ -1,20 +1,22 @@
 import torch
 import re
 import json
+# Ensure vllm is optional for users who only use transformers engine
+try:
+    from vllm import LLM, SamplingParams
+except ImportError:
+    LLM, SamplingParams = None, None 
+    # print("Warning: vLLM not installed. vLLM engine will not be available.")
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 import os
 from collections import defaultdict
 import difflib
 from enum import Enum
-from typing import List, Union, Dict, Optional
-
 from .faker_utils import FakePIIGenerator
+import gc # For garbage collection, potentially useful with vLLM model switching
 
-try:
-    from vllm import LLM, SamplingParams
-except ImportError:
-    LLM, SamplingParams = None, None
 
 class PIIHandlingMode(Enum):
     """Enum for different PII handling modes"""
@@ -55,6 +57,14 @@ class PIIType(Enum):
     RELIGIOUS_AFFILIATION = (
         "religious_affiliation"  # Anything that identifies religious affiliation
     )
+    LOCATION = "location" # Added LOCATION if it was missing, ensure it's defined once
+    IP_ADDRESS = "ip_address" # Added IP_ADDRESS if it was missing, ensure it's defined once
+
+# Ensure LOCATION and IP_ADDRESS are not duplicated if they were already present above.
+# The primary definition should be kept. This is a safeguard.
+# For example, if LOCATION = "location" is already defined above, these lines would be redundant.
+# However, to be safe for the edit tool, we list them here. A manual check might be needed if errors occur.
+# A better approach is to ensure the enum is complete and correct once.
 
 
 def parse_tagged_string(tagged_str):
@@ -219,108 +229,186 @@ def apply_tags(
 
 class PIIRedactor:
     def __init__(self, device=None, engine="transformers"):
-        """
-        Initialize the PIIRedactor with models for PII detection.
-
-        Args:
-            device (str): Device to use for inference (e.g., 'cuda', 'cpu')
-            engine (str): Backend to use for generation ('transformers' or 'vllm')
-        """
         if engine == "vllm" and LLM is None:
             raise ImportError(
-                "vLLM engine selected, but vllm package not installed or failed to import. "
-                "Please install with `pip install vllm`."
+                "vLLM engine selected, but vllm package not installed or failed to import."
             )
-
         self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device == "cuda" and engine == "vllm" and not torch.cuda.is_available():
+            print("Warning: CUDA specified but not available. vLLM might not work as expected.")
+        
         self.engine = engine
-        self.loaded_models = {}  # For transformers engine
-        self.llm = None  # For vLLM engine, initialized in _initialize_model
-        self.default_vllm_max_new_tokens = 1024 # Default max tokens for vLLM
+        self.loaded_models = {}  # For transformers engine: stores {model_path: {'model': model, 'tokenizer': tokenizer}}
+        self.llm = None  # For vLLM engine: stores the LLM instance
+        self.current_vllm_model_path = None # Tracks the currently loaded vLLM model path
+        self.default_vllm_max_new_tokens = 1024 # Default for vLLM if not specified per model
 
-        base_prompt_template = (
-            "[INST] You are an expert PII redaction bot. "
-            "Your task is to identify and tag PII in the given text.\n"
-            "The PII types to identify are: {tags_to_identify}.\n"
-            "Wrap each identified PII with XML-like tags, e.g., <PII:PERSON_NAME>John Doe</PII:PERSON_NAME>.\n"
-            "Input text:\n{text_to_process}\nTagged text:\n[/INST]"
-        )
-
+        # Define model configurations
+        # Each model is a dictionary with 'path', 'tags' (list of PII types it's good at),
+        # 'prompt_template_format_string', 'max_new_tokens' (optional, for vLLM mainly),
+        # and 'exclusive_tags' (boolean, if True, its tags won't be processed by subsequent models for a given document part)
+        # 'dtype' is also model-specific for precision control (e.g., torch.bfloat16)
         self.models = [
             {
-                "model_name_or_path": "openpipe/mistral-7b-opi-pii-tagger-v1.1",
-                "tags": "all",  # Specifies which PII types this model config targets. 'all' or list of PIIType.value
-                "prompt_template_format_string": base_prompt_template,
-                "max_new_tokens": 1024,  # Max new tokens for this model (vLLM and Transformers)
-                "exclusive_tags": False, # If true, text tagged by this model won't be passed to subsequent models
+                "path": "OpenPipe/Pii-Redact-Name", 
+                "tags": [
+                    PIIType.PERSON_NAME,
+                    PIIType.ORGANIZATION_NAME,
+                ],
+                "prompt_template_format_string": "<SYS>You are a PII detection expert. Identify the following PII types: {tags_to_identify}. Output only the PII entities, each on a new line, enclosed in XML tags corresponding to their PII type. If no PII is found, output 'NO_PII_FOUND'.</SYS>\nText to process: {text_to_process}",
+                "max_new_tokens": 128, 
+                "exclusive_tags": True, 
+                "dtype": torch.bfloat16 if self.device == "cuda" else torch.float32 
+            },
+            {
+                "path": "OpenPipe/Pii-Redact-General", 
+                "tags": [
+                    PIIType.LOCATION,
+                    PIIType.PHONE_NUMBER,
+                    PIIType.EMAIL_ADDRESS,
+                    PIIType.CREDIT_CARD_INFO,
+                    PIIType.IP_ADDRESS,
+                    PIIType.DATE,
+                    PIIType.AGE,
+                    PIIType.NATIONALITY,
+                    PIIType.DATE_OF_BIRTH,
+                    PIIType.DOMAIN_NAME,
+                    PIIType.DEMOGRAPHIC_GROUP,
+                    PIIType.GENDER,
+                    PIIType.PERSONAL_ID,
+                    PIIType.OTHER_ID,
+                    PIIType.BANKING_NUMBER,
+                    PIIType.MEDICAL_CONDITION,
+                    PIIType.STREET_ADDRESS,
+                    PIIType.PASSWORD,
+                    PIIType.SECURE_CREDENTIAL,
+                    PIIType.RELIGIOUS_AFFILIATION
+                ],
+                "prompt_template_format_string": "<SYS>You are a PII detection expert. Identify the following PII types: {tags_to_identify}. Output only the PII entities, each on a new line, enclosed in XML tags corresponding to their PII type. If no PII is found, output 'NO_PII_FOUND'.</SYS>\nText to process: {text_to_process}",
+                "max_new_tokens": 128, # Can be adjusted if general model needs more/less
+                "exclusive_tags": True, 
+                "dtype": torch.bfloat16 if self.device == "cuda" else torch.float32 
             }
-            # Example for a second model focusing on specific tags if needed:
-            # {
-            #     "model_name_or_path": "openpipe/mistral-7b-opi-pii-tagger-v1.1", # Or a different model
-            #     "tags": [PIIType.CREDIT_CARD_INFO.value, PIIType.BANKING_NUMBER.value],
-            #     "prompt_template_format_string": base_prompt_template,
-            #     "max_new_tokens": 512,
-            #     "exclusive_tags": True,
-            # }
         ]
-        self.focus_tags = "all"  # Default to all tags, can be changed by user
 
-        if self.engine == "vllm" and self.models:
-            tokenizer_path = self.models[0]["model_name_or_path"]
-            try:
-                hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-                self.max_model_len_hint = hf_tokenizer.model_max_length if hasattr(hf_tokenizer, 'model_max_length') and hf_tokenizer.model_max_length else 4096
-                del hf_tokenizer
-            except Exception as e:
-                print(f"Warning: Could not load tokenizer for {tokenizer_path} to determine max_model_len_hint: {e}")
-                self.max_model_len_hint = 4096 # Fallback
-
-    def _initialize_model(self, index):
-        """Initialize a specific model if it hasn't been already."""
-        model_config = self.models[index]
-        model_name_or_path = model_config["model_name_or_path"]
-
-        if self.engine == "transformers":
-            if model_name_or_path not in self.loaded_models or self.loaded_models[model_name_or_path] is None:
-                tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, padding_side="left")
-                tokenizer.pad_token = tokenizer.eos_token # Ensure pad token is set
-                model = AutoModelForCausalLM.from_pretrained(model_name_or_path)
-                if self.device:
-                    model.to(self.device)
-                elif torch.cuda.is_available():
-                    model.to("cuda")
-                model.eval() # Set to evaluation mode
-                self.loaded_models[model_name_or_path] = {"model": model, "tokenizer": tokenizer}
-        elif self.engine == "vllm":
-            if self.llm is None:
-                if LLM is None: # Should have been caught in __init__, but double check
-                    raise ImportError("vLLM not installed. Please install with `pip install vllm`.")
-                self.llm = LLM(
-                    model=model_name_or_path, 
-                    trust_remote_code=True, # Added for models like Mistral
-                    max_model_len=model_config.get("max_model_len", self.max_model_len_hint) # Use model specific or default hint
+        # Validate that all tags in model configs are valid PIIType members
+        for model_config in self.models:
+            if not isinstance(model_config.get("tags"), list) or not all(
+                isinstance(tag, PIIType) for tag in model_config.get("tags", [])
+            ):
+                raise ValueError(
+                    f"Model configuration for {model_config.get('path')} has invalid 'tags'. "
+                    f"Must be a list of PIIType members."
                 )
-                # SamplingParams will be created dynamically in tag_pii_in_documents or _model_call
+            if not isinstance(model_config.get("prompt_template_format_string"), str):
+                 raise ValueError(
+                    f"Model configuration for {model_config.get('path')} requires 'prompt_template_format_string' as a string."
+                )
+            if not isinstance(model_config.get("path"), str):
+                 raise ValueError(
+                    f"Model configuration requires 'path' as a string."
+                )
 
-    def _unload_model(self, index):
-        """Unload a specific model to free GPU memory."""
-        model_config = self.models[index]
-        model_name_or_path = model_config["model_name_or_path"]
+    def _get_model_config(self, model_index):
+        if 0 <= model_index < len(self.models):
+            return self.models[model_index]
+        raise ValueError(f"Model index {model_index} is out of range.")
+
+    def _initialize_model(self, model_index):
+        model_config = self._get_model_config(model_index)
+        model_path = model_config["path"]
+        model_dtype = model_config.get("dtype", torch.float32 if self.engine == "transformers" else None) 
 
         if self.engine == "transformers":
-            if model_name_or_path in self.loaded_models and self.loaded_models[model_name_or_path] is not None:
-                del self.loaded_models[model_name_or_path]["model"]
-                del self.loaded_models[model_name_or_path]["tokenizer"]
-                self.loaded_models[model_name_or_path] = None
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            if model_path not in self.loaded_models:
+                print(f"Initializing Hugging Face model: {model_path} on {self.device}")
+                # Determine torch_dtype for transformers
+                torch_dtype_for_transformers = model_dtype if model_dtype else torch.float32
+                if self.device == "cuda" and torch_dtype_for_transformers == torch.float32 and torch.cuda.is_bf16_supported():
+                    # Prefer bfloat16 on CUDA if float32 is specified but bfloat16 is available and supported
+                    # This is a common optimization, but can be made more explicit in config if needed.
+                    torch_dtype_for_transformers = torch.bfloat16
+                
+                tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path, 
+                    torch_dtype=torch_dtype_for_transformers, 
+                    trust_remote_code=True
+                )
+                model.to(self.device)
+                model.eval() # Set to evaluation mode
+                self.loaded_models[model_path] = {"model": model, "tokenizer": tokenizer}
+        
         elif self.engine == "vllm":
-            if self.llm is not None and model_name_or_path == self.models[0]["model_name_or_path"]: 
-                del self.llm
-                self.llm = None
-                # self.sampling_params removed
+            if self.llm is None or self.current_vllm_model_path != model_path:
+                if self.llm is not None:
+                    del self.llm
+                    if self.device == "cuda":
+                        torch.cuda.empty_cache()
+                    self.llm = None 
+                    self.current_vllm_model_path = None
+
+                print(f"Initializing vLLM model: {model_path} on {self.device}")
+                
+                # Determine dtype_str for vLLM from torch.dtype
+                dtype_str = "auto"
+                if model_dtype == torch.bfloat16:
+                    dtype_str = "bfloat16"
+                elif model_dtype == torch.float16:
+                    dtype_str = "half"
+                elif model_dtype == torch.float32:
+                    dtype_str = "float32"
+                # vLLM also supports "float" (same as float32) and "auto"
+
+                try:
+                    self.llm = LLM(
+                        model=model_path,
+                        tokenizer=model_path, 
+                        tensor_parallel_size=torch.cuda.device_count() if self.device == "cuda" and torch.cuda.is_available() else 1,
+                        dtype=dtype_str,
+                        trust_remote_code=True,  # Ensure this is True
+                        max_model_len=model_config.get("max_model_len") # Optional: if you want to set it explicitly
+                    )
+                    self.current_vllm_model_path = model_path
+                except Exception as e:
+                    print(f"Error initializing vLLM model {model_path}: {e}")
+                    raise
+        else:
+            raise ValueError(f"Unsupported engine: {self.engine}")
+
+    def _unload_model(self, model_index=None, unload_all=False):
+        if unload_all:
+            if self.engine == "transformers":
+                for model_path in self.loaded_models:
+                    del self.loaded_models[model_path]["model"]
+                    del self.loaded_models[model_path]["tokenizer"]
+                    self.loaded_models[model_path] = None
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+            elif self.engine == "vllm":
+                if self.llm is not None:
+                    del self.llm
+                    if self.device == "cuda":
+                        torch.cuda.empty_cache()
+                    self.llm = None
+                    self.current_vllm_model_path = None
+        else:
+            if self.engine == "transformers":
+                model_config = self._get_model_config(model_index)
+                model_path = model_config["path"]
+                if model_path in self.loaded_models and self.loaded_models[model_path] is not None:
+                    del self.loaded_models[model_path]["model"]
+                    del self.loaded_models[model_path]["tokenizer"]
+                    self.loaded_models[model_path] = None
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            elif self.engine == "vllm":
+                if self.llm is not None and model_index == 0: 
+                    del self.llm
+                    if self.device == "cuda":
+                        torch.cuda.empty_cache()
+                    self.llm = None
+                    self.current_vllm_model_path = None
 
     def _model_call(self, text, model_index):
         """
@@ -334,15 +422,15 @@ class PIIRedactor:
             str: The processed text with PII tags
         """
         # self._initialize_model(model_index) # Initialization is now handled in tag_pii_in_documents loop
-        model_config = self.models[model_index]
-        model_name_or_path = model_config["model_name_or_path"]
+        model_config = self._get_model_config(model_index)
+        model_path = model_config["path"]
 
         # Determine tags_to_identify string for this model_config
         tags_to_identify_list = model_config["tags"]
         if isinstance(tags_to_identify_list, str) and tags_to_identify_list.lower() == "all":
             tags_to_identify_str = ", ".join([pii_type.value for pii_type in PIIType])
         elif isinstance(tags_to_identify_list, list):
-            tags_to_identify_str = ", ".join(tags_to_identify_list)
+            tags_to_identify_str = ", ".join([tag.value for tag in tags_to_identify_list])
         else:
             print(f"Warning: Invalid 'tags' format in model config {model_index}: {tags_to_identify_list}. Using empty tag list.")
             tags_to_identify_str = ""
@@ -353,11 +441,11 @@ class PIIRedactor:
         )
 
         if self.engine == "transformers":
-            if model_name_or_path not in self.loaded_models or self.loaded_models[model_name_or_path] is None:
+            if model_path not in self.loaded_models or self.loaded_models[model_path] is None:
                 # This should not happen if _initialize_model was called correctly
-                raise RuntimeError(f"Transformers model {model_name_or_path} not initialized before _model_call.")
+                raise RuntimeError(f"Transformers model {model_path} not initialized before _model_call.")
             
-            model_data = self.loaded_models[model_name_or_path]
+            model_data = self.loaded_models[model_path]
             model = model_data["model"]
             tokenizer = model_data["tokenizer"]
             
@@ -444,7 +532,7 @@ class PIIRedactor:
                 if isinstance(tags_to_identify_list, str) and tags_to_identify_list.lower() == "all":
                     tags_to_identify_str = ", ".join([pii_type.value for pii_type in PIIType])
                 elif isinstance(tags_to_identify_list, list):
-                    tags_to_identify_str = ", ".join(tags_to_identify_list)
+                    tags_to_identify_str = ", ".join([tag.value for tag in tags_to_identify_list])
                 else:
                     print(f"Warning: Invalid 'tags' format in model config {model_idx}: {tags_to_identify_list}. Using empty tag list.")
                     tags_to_identify_str = ""
@@ -513,7 +601,7 @@ class PIIRedactor:
         processed_documents = []
         for doc, outputs in zip(documents, outputs_by_doc):
             processed_doc = apply_tags(
-                doc, [tagged_text for _, tagged_text in outputs], self.focus_tags, mode=mode, locale=locale
+                doc, [tagged_text for _, tagged_text in outputs], self.models[0]["tags"], mode=mode, locale=locale
             )
             processed_documents.append(processed_doc)
 
