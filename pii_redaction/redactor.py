@@ -175,22 +175,11 @@ def apply_tags(
 
     for tstr, include_tags in zip(tagged_strings, tags_to_include):
         cleaned, annotations = parse_tagged_string(tstr)
-        for ann_start, ann_end, tag, text in annotations: # 'tag' here is a string from the parser
-            # Debug prints
-            print(f"DEBUG: apply_tags - Current tag from parser: {tag} (type: {type(tag)})")
-            print(f"DEBUG: apply_tags - include_tags for this model output: {include_tags} (type: {type(include_tags)})")
-            if hasattr(include_tags, '__iter__') and not isinstance(include_tags, str):
-                for item in include_tags:
-                    print(f"DEBUG: apply_tags - item in include_tags: {item} (type: {type(item)})")
-            else:
-                print(f"DEBUG: apply_tags - include_tags is NOT iterable or is a string.")
-
-            # 'include_tags' is expected to be a list of PIIType enum members for the current model.
-            # We need to check if the string 'tag' matches the .value of any PIIType in include_tags.
+        for ann_start, ann_end, tag, text in annotations: 
             if include_tags is not None and tag not in [pii_type.value for pii_type in include_tags]:
-                continue # This was original line 179
+                continue 
 
-            rel = ann_start / len(cleaned) if cleaned else 0 # This was original line 181
+            rel = ann_start / len(cleaned) if cleaned else 0 
             start_hint = int(rel * len(original))
             orig_start = find_best_match(text, original, start_hint)
             if orig_start == -1:
@@ -617,9 +606,19 @@ class PIIRedactor:
             current_doc_texts_for_processing = next_iteration_doc_texts 
 
         processed_documents = []
-        for doc, outputs in zip(documents, outputs_by_doc):
+        for doc, outputs_for_doc in zip(documents, outputs_by_doc):
+            # outputs_for_doc is a list of tuples: [(model_idx, tagged_text), ...]
+            tagged_texts_from_models = [tagged_text for _, tagged_text in outputs_for_doc]
+            # model_specific_tags should be a list of lists of PIIType enums, 
+            # corresponding to each tagged_text from models.
+            model_specific_tags = [self.models[model_idx]['tags'] for model_idx, _ in outputs_for_doc]
+            
             processed_doc = apply_tags(
-                doc, [tagged_text for _, tagged_text in outputs], self.models[0]["tags"], mode=mode, locale=locale
+                doc, 
+                tagged_texts_from_models, 
+                model_specific_tags,  # Pass the correctly structured list of tag lists
+                mode=mode, 
+                locale=locale
             )
             processed_documents.append(processed_doc)
 
