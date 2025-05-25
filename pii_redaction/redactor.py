@@ -232,6 +232,9 @@ class PIIRedactor:
         self.models = [None] * len(self.model_paths)
         self.tokenizers = [None] * len(self.model_paths)
 
+        # Keep the token budget small to avoid large KV caches when using vLLM.
+        self.max_tokens = 128
+
     def _initialize_model(self, index):
         """Initialize a specific model if it hasn't been already."""
         if self.models[index] is None:
@@ -250,11 +253,26 @@ class PIIRedactor:
                     self.models[index] = self.models[index].to("cuda")
             elif self.engine == "vllm":
                 from vllm import LLM
-                self.models[index] = LLM(model=self.model_paths[index])
+                # Reduce the maximum sequence length to keep memory usage low.
+                self.models[index] = LLM(
+                    model=self.model_paths[index],
+                    max_model_len=self.max_tokens,
+                )
                 self.tokenizers[index] = AutoTokenizer.from_pretrained(
                     self.model_paths[index], padding_side="left"
                 )
                 self.tokenizers[index].padding_side = "left"
+
+    def _unload_model(self, index):
+        """Unload a specific model to free GPU memory."""
+        if self.models[index] is not None:
+            del self.models[index]
+            self.models[index] = None
+        if self.tokenizers[index] is not None:
+            del self.tokenizers[index]
+            self.tokenizers[index] = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _model_call(self, text, model_index):
         """
@@ -295,7 +313,7 @@ class PIIRedactor:
                 outputs = model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    max_new_tokens=1024,
+                    max_new_tokens=self.max_tokens,
                     pad_token_id=tokenizer.eos_token_id,
                 )
 
@@ -305,7 +323,7 @@ class PIIRedactor:
         else:  # vllm engine
             from vllm import SamplingParams
 
-            sampling_params = SamplingParams(max_tokens=1024)
+            sampling_params = SamplingParams(max_tokens=self.max_tokens)
             outputs = model.generate([prompt], sampling_params)
             return outputs[0].outputs[0].text
 
@@ -324,17 +342,22 @@ class PIIRedactor:
         Returns:
             list: List of documents with PII handled according to the specified mode.
         """
-        processed_documents = []
+        processed_outputs = [[] for _ in documents]
 
-        for doc in documents:
-            model_outputs = []
-
-            for idx in range(len(self.model_paths)):
+        for idx in range(len(self.model_paths)):
+            # Process all documents with one model before loading the next to
+            # keep memory usage low.
+            for doc_idx, doc in enumerate(documents):
                 model_output = self._model_call(doc, idx)
-                model_outputs.append(model_output)
+                processed_outputs[doc_idx].append(model_output)
 
+            # Release GPU memory used by the model before moving on.
+            self._unload_model(idx)
+
+        processed_documents = []
+        for doc, outputs in zip(documents, processed_outputs):
             processed_doc = apply_tags(
-                doc, model_outputs, self.focus_tags, mode=mode, locale=locale
+                doc, outputs, self.focus_tags, mode=mode, locale=locale
             )
             processed_documents.append(processed_doc)
 
