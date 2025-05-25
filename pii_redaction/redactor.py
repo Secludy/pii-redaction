@@ -265,7 +265,7 @@ class PIIRedactor:
                 ],
                 "prompt_template_format_string": "<SYS>You are a PII detection expert. Identify the following PII types: {tags_to_identify}. Output only the PII entities, each on a new line, enclosed in XML tags corresponding to their PII type. If no PII is found, output 'NO_PII_FOUND'.</SYS>\nText to process: {text_to_process}",
                 "max_new_tokens": 128, 
-                "exclusive_tags": True, 
+                "exclusive_tags": False, 
                 "dtype": torch.bfloat16 if self.device == "cuda" else torch.float32 
             },
             {
