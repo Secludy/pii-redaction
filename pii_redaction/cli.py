@@ -81,20 +81,19 @@ def main():
             locale=args.locale,
         )
     elif args.command == "process-text":
-        with open(args.input, "r") as f:
-            documents = [line.strip() for line in f if line.strip()]
+        with open(args.input, "r") as fin:
+            doc_count = sum(1 for _ in fin)
 
-        tagged_documents = tag_pii_in_documents(
-            documents,
-            device=args.device,
-            engine=args.engine,
-            mode=args.mode,
-            locale=args.locale,
-        )
-
-        with open(args.output, "w") as f:
-            for doc in tagged_documents:
-                f.write(doc + "\n")
+        with open(args.input, "r") as fin, open(args.output, "w") as fout:
+            documents = (line.strip() for line in fin if line.strip())
+            tag_pii_in_documents(
+                documents,
+                device=args.device,
+                engine=args.engine,
+                mode=args.mode,
+                locale=args.locale,
+                output_file=fout,
+            )
 
         mode_descriptions = {
             PIIHandlingMode.TAG: "Tagged",
@@ -102,9 +101,7 @@ def main():
             PIIHandlingMode.REPLACE: "Replaced",
         }
         action = mode_descriptions[args.mode]
-        print(
-            f"{action} PII in {len(tagged_documents)} documents and saved to {args.output}"
-        )
+        print(f"{action} PII in {doc_count} documents and saved to {args.output}")
     else:
         parser.print_help()
 

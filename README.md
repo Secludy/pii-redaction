@@ -53,6 +53,10 @@ For handling PII in plain text files (one document per line):
 pii-redact process-text input.txt output.txt
 ```
 
+This command streams the input file line by line, writing each processed
+document to the output file immediately. This avoids keeping all processed
+documents in memory and works well with large files.
+
 Options:
 - `--device`: Device to use for processing (e.g., cuda, cpu)
 - `--engine`: Generation backend (`transformers` or `vllm`)

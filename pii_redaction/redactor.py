@@ -276,8 +276,14 @@ class PIIRedactor:
         tokenizer.pad_token = tokenizer.eos_token
 
         messages = [{"role": "user", "content": text}]
+        # ``apply_chat_template`` can return either a string or a tokenized
+        # representation depending on the ``transformers`` version.  VLLM
+        # expects the prompt as a plain string, so ensure we explicitly request
+        # an untokenized string.
         prompt = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, return_dict=False
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
         )
 
         if self.engine == "transformers":
@@ -303,7 +309,13 @@ class PIIRedactor:
             outputs = model.generate([prompt], sampling_params)
             return outputs[0].outputs[0].text
 
-    def tag_pii_in_documents(self, documents, mode=PIIHandlingMode.TAG, locale="en_US"):
+    def tag_pii_in_documents(
+        self,
+        documents,
+        mode=PIIHandlingMode.TAG,
+        locale="en_US",
+        output_file=None,
+    ):
         """
         Process a list of documents to identify and handle PII according to the specified mode.
 
@@ -315,10 +327,18 @@ class PIIRedactor:
                 - REPLACE: Replace PII with fake data
             locale (str): Locale for generating fake data (only used if mode=REPLACE)
 
-        Returns:
-            list: List of documents with PII handled according to the specified mode.
+        If ``output_file`` is provided, processed documents are written to the file
+        as they are generated. Otherwise a list of processed documents is
+        returned.
         """
-        processed_documents = []
+        processed_documents = [] if output_file is None else None
+
+        file_obj = None
+        if output_file is not None:
+            if isinstance(output_file, str):
+                file_obj = open(output_file, "w")
+            else:
+                file_obj = output_file
 
         for doc in documents:
             model_outputs = []
@@ -330,7 +350,14 @@ class PIIRedactor:
             processed_doc = apply_tags(
                 doc, model_outputs, self.focus_tags, mode=mode, locale=locale
             )
-            processed_documents.append(processed_doc)
+            if file_obj is not None:
+                file_obj.write(processed_doc + "\n")
+                file_obj.flush()
+            else:
+                processed_documents.append(processed_doc)
+
+        if file_obj is not None and isinstance(output_file, str):
+            file_obj.close()
 
         return processed_documents
 
@@ -341,6 +368,7 @@ def tag_pii_in_documents(
     engine="transformers",
     mode=PIIHandlingMode.TAG,
     locale="en_US",
+    output_file=None,
 ):
     """
     Convenience function to process a list of documents through a PII tagging model.
@@ -354,12 +382,16 @@ def tag_pii_in_documents(
             - REDACT: Replace PII with empty tags
             - REPLACE: Replace PII with fake data
         locale (str): Locale for generating fake data (only used if mode=REPLACE)
+        output_file (file or str, optional): If provided, processed documents are
+            written to this file as they are generated.
 
     Returns:
-        list: List of documents with PII handled according to the specified mode.
+        list or None: List of processed documents, or ``None`` if ``output_file`` is provided.
     """
     redactor = PIIRedactor(device=device, engine=engine)
-    return redactor.tag_pii_in_documents(documents, mode=mode, locale=locale)
+    return redactor.tag_pii_in_documents(
+        documents, mode=mode, locale=locale, output_file=output_file
+    )
 
 
 def clean_dataset(
