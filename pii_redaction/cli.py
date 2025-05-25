@@ -40,6 +40,12 @@ def main():
             default="en_US",
             help="Locale for generating fake data (default: en_US, only used with --replace)",
         )
+        parser.add_argument(
+            "--engine",
+            choices=["transformers", "vllm"],
+            default="transformers",
+            help="Generation backend to use (default: transformers)",
+        )
 
     # Process JSONL dataset command
     jsonl_parser = subparsers.add_parser(
@@ -70,6 +76,7 @@ def main():
             args.input,
             args.output,
             device=args.device,
+            engine=args.engine,
             mode=args.mode,
             locale=args.locale,
         )
@@ -78,7 +85,11 @@ def main():
             documents = [line.strip() for line in f if line.strip()]
 
         tagged_documents = tag_pii_in_documents(
-            documents, device=args.device, mode=args.mode, locale=args.locale
+            documents,
+            device=args.device,
+            engine=args.engine,
+            mode=args.mode,
+            locale=args.locale,
         )
 
         with open(args.output, "w") as f:

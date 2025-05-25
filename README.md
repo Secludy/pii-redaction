@@ -8,6 +8,12 @@ A Python package for redacting Personally Identifiable Information (PII) from te
 pip install pii-redaction
 ```
 
+To use the faster `vllm` backend, install with the optional `vllm` extra:
+
+```bash
+pip install pii-redaction[vllm]
+```
+
 Or install from source:
 
 ```bash
@@ -32,6 +38,7 @@ pii-redact process-jsonl input.jsonl output.jsonl
 
 Options:
 - `--device`: Device to use for processing (e.g., cuda, cpu)
+- `--engine`: Generation backend (`transformers` or `vllm`)
 - PII handling modes (mutually exclusive):
   - `--tag`: Keep PII content between XML tags (default) `<PII:type>content</PII:type>`
   - `--redact`: Replace PII with just an empty tag `<PII:type/>`
@@ -48,6 +55,7 @@ pii-redact process-text input.txt output.txt
 
 Options:
 - `--device`: Device to use for processing (e.g., cuda, cpu)
+- `--engine`: Generation backend (`transformers` or `vllm`)
 - PII handling modes (mutually exclusive):
   - `--tag`: Keep PII content between XML tags (default) `<PII:type>content</PII:type>`
   - `--redact`: Replace PII with just an empty tag `<PII:type/>`
@@ -93,31 +101,41 @@ documents = [
 ]
 
 # Tag PII (default mode)
-tagged_documents = tag_pii_in_documents(documents, mode=PIIHandlingMode.TAG)
+tagged_documents = tag_pii_in_documents(
+    documents,
+    mode=PIIHandlingMode.TAG,
+    engine="transformers",
+)
 
 # Redact PII completely
-redacted_documents = tag_pii_in_documents(documents, mode=PIIHandlingMode.REDACT)
+redacted_documents = tag_pii_in_documents(
+    documents,
+    mode=PIIHandlingMode.REDACT,
+    engine="transformers",
+)
 
 # Replace PII with fake data
 anonymized_documents = tag_pii_in_documents(
-    documents, 
+    documents,
     mode=PIIHandlingMode.REPLACE,
-    locale="en_US"
+    locale="en_US",
+    engine="transformers",
 )
 
 # Process a JSONL dataset
 # Tag PII (default mode)
-clean_dataset('input.jsonl', 'output.jsonl', mode=PIIHandlingMode.TAG)
+clean_dataset('input.jsonl', 'output.jsonl', mode=PIIHandlingMode.TAG, engine="transformers")
 
 # Redact PII in a JSONL dataset
-clean_dataset('input.jsonl', 'redacted.jsonl', mode=PIIHandlingMode.REDACT)
+clean_dataset('input.jsonl', 'redacted.jsonl', mode=PIIHandlingMode.REDACT, engine="transformers")
 
 # Replace PII with fake data in a JSONL dataset
 clean_dataset(
-    'input.jsonl', 
-    'anonymized.jsonl', 
+    'input.jsonl',
+    'anonymized.jsonl',
     mode=PIIHandlingMode.REPLACE,
-    locale="en_US"
+    locale="en_US",
+    engine="transformers"
 )
 ```
 
