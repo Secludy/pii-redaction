@@ -264,7 +264,7 @@ class PIIRedactor:
                     PIIType.ORGANIZATION_NAME,
                 ],
                 "prompt_template_format_string": "<SYS>You are a PII detection expert. Identify the following PII types: {tags_to_identify}. Output only the PII entities, each on a new line, enclosed in XML tags corresponding to their PII type. If no PII is found, output 'NO_PII_FOUND'.</SYS>\nText to process: {text_to_process}",
-                "max_new_tokens": 128, 
+                "max_new_tokens": 1024, 
                 "exclusive_tags": False, 
                 "strict_apply_filter": True,
                 "dtype": torch.bfloat16 if self.device == "cuda" else torch.float32 
@@ -286,7 +286,7 @@ class PIIRedactor:
                     PIIType.RELIGIOUS_AFFILIATION
                 ],
                 "prompt_template_format_string": "<SYS>You are a PII detection expert. Identify the following PII types: {tags_to_identify}. Output only the PII entities, each on a new line, enclosed in XML tags corresponding to their PII type. If no PII is found, output 'NO_PII_FOUND'.</SYS>\nText to process: {text_to_process}",
-                "max_new_tokens": 128, # Can be adjusted if general model needs more/less
+                "max_new_tokens": 1024, # Can be adjusted if general model needs more/less
                 "exclusive_tags": False, 
                 "strict_apply_filter": False,
                 "dtype": torch.bfloat16 if self.device == "cuda" else torch.float32 
@@ -412,12 +412,12 @@ class PIIRedactor:
                     self.llm = None
                     self.current_vllm_model_path = None
 
-    def _model_call(self, text, model_index):
+    def _model_call(self, raw_text_to_process, model_index):
         """
         Process text through a specific model to identify PII entities.
 
         Args:
-            text (str): The text to process
+            raw_text_to_process (str): The raw text to process.
             model_index (int): Index of the model config to use.
 
         Returns:
@@ -427,78 +427,106 @@ class PIIRedactor:
 
         model_config = self._get_model_config(model_index)
         model_path = model_config["path"]
+        configured_max_new_tokens = model_config.get("max_new_tokens", 1024) # Default to 1024
 
-        # Determine tags_to_identify string for this model_config
-        tags_to_identify_list = model_config["tags"]
-        if isinstance(tags_to_identify_list, str) and tags_to_identify_list.lower() == "all":
-            tags_to_identify_str = ", ".join([pii_type.value for pii_type in PIIType])
-        elif isinstance(tags_to_identify_list, list):
-            tags_to_identify_str = ", ".join([tag.value for tag in tags_to_identify_list])
-        else:
-            print(f"Warning: Invalid 'tags' format in model config {model_index}: {tags_to_identify_list}. Using empty tag list.")
-            tags_to_identify_str = ""
-        
-        prompt = model_config["prompt_template_format_string"].format(
-            tags_to_identify=tags_to_identify_str,
-            text_to_process=text
-        )
+        messages = [{"role": "user", "content": raw_text_to_process}]
 
         if self.engine == "transformers":
             if model_path not in self.loaded_models or self.loaded_models[model_path] is None:
-                # This should not happen if _initialize_model was called correctly
                 raise RuntimeError(f"Transformers model {model_path} not initialized before _model_call.")
-            
+        
             model_data = self.loaded_models[model_path]
             model = model_data["model"]
             tokenizer = model_data["tokenizer"]
-            
-            encoded_input = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=tokenizer.model_max_length if hasattr(tokenizer, 'model_max_length') else 2048)
-            input_ids = encoded_input["input_ids"].to(model.device)
-            attention_mask = encoded_input["attention_mask"].to(model.device)
-            
-            # Calculate max_new_tokens based on model's max length and prompt length
-            # Fallback for max_length if tokenizer.model_max_length is not available
-            effective_max_len = tokenizer.model_max_length if hasattr(tokenizer, 'model_max_length') and tokenizer.model_max_length else 2048
-            # Ensure prompt is not longer than model's capacity
-            prompt_token_length = input_ids.shape[1]
-            if prompt_token_length >= effective_max_len:
-                 # Handle cases where the prompt itself is too long
-                print(f"Warning: Prompt length ({prompt_token_length}) exceeds model max length ({effective_max_len}). Truncation occurred. Output might be compromised.")
-                # Option: return empty or error, or let the model handle truncated input if possible
-                # For now, let it proceed, but be aware of potential issues.
-            
-            # Use max_new_tokens from model_config, ensuring it doesn't exceed model capacity given prompt length
-            configured_max_new = model_config.get("max_new_tokens", 512) # Default if not in config
-            allowable_max_new = max(0, effective_max_len - prompt_token_length - 5) # -5 for safety margin
-            actual_max_new_tokens = min(configured_max_new, allowable_max_new)
+        
+            # Apply chat template and tokenize
+            try:
+                # Some tokenizers might not support add_generation_prompt directly in apply_chat_template
+                # or expect it to be handled differently. Standard practice is to include it.
+                encoded_input = tokenizer.apply_chat_template(
+                    messages, 
+                    tokenize=True, 
+                    add_generation_prompt=True, # Important for generation
+                    return_tensors="pt"
+                )
+            except Exception as e:
+                # Fallback or simpler application if the above fails (e.g. older tokenizer versions)
+                print(f"Warning: tokenizer.apply_chat_template with add_generation_prompt failed: {e}. Falling back.")
+                # This fallback might be model-specific. For now, a common alternative:
+                prompt_str = tokenizer.decode(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True))
+                encoded_input = tokenizer(prompt_str, return_tensors="pt", truncation=True, max_length=tokenizer.model_max_length if hasattr(tokenizer, 'model_max_length') else 2048)
 
-            if actual_max_new_tokens <= 0:
+            input_ids = encoded_input["input_ids"].to(model.device)
+            # attention_mask might not be returned by apply_chat_template if tokenize=True for some versions/models
+            # or it might be part of encoded_input. If not, generate() can often infer it for causal LMs.
+            attention_mask = encoded_input.get("attention_mask") 
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(model.device)
+        
+            # Ensure prompt is not longer than model's capacity - this check is less direct with apply_chat_template
+            # as the template itself adds tokens. The tokenizer's truncation (if applied above) should handle it.
+            prompt_token_length = input_ids.shape[1]
+            effective_max_len = getattr(tokenizer, 'model_max_length', 2048)
+
+            if prompt_token_length >= effective_max_len:
+                print(f"Warning: Input length ({prompt_token_length}) after chat template potentially exceeds model max length ({effective_max_len}). Output might be compromised.")
+                # actual_max_new_tokens might become 0 or negative if not handled.
+
+            # Use configured_max_new_tokens, ensuring it doesn't exceed model capacity given prompt length
+            # This calculation might need adjustment if truncation is handled by tokenizer.apply_chat_template or generate
+            allowable_max_new = max(0, effective_max_len - prompt_token_length - 5) # -5 for safety margin
+            actual_max_new_tokens = min(configured_max_new_tokens, allowable_max_new)
+
+            if actual_max_new_tokens <= 0 and prompt_token_length < effective_max_len:
+                 # If allowable_max_new is zero due to prompt length, but there's technically space
+                 actual_max_new_tokens = configured_max_new_tokens # Try with configured, model.generate might truncate if needed
+            elif actual_max_new_tokens <= 0:
                 print(f"Warning: No space for new tokens. Prompt length {prompt_token_length}, model max {effective_max_len}. Returning empty string.")
-                return "" # Or handle error appropriately
+                return "" 
 
             with torch.no_grad():
                 outputs_tensor = model.generate(
                     input_ids=input_ids,
-                    attention_mask=attention_mask,
+                    attention_mask=attention_mask, # Pass attention_mask if available
                     max_new_tokens=actual_max_new_tokens,
                     pad_token_id=tokenizer.eos_token_id,
-                    temperature=0.0, top_p=1.0, num_beams=1 # Added generation params
+                    temperature=0.0, top_p=1.0, num_beams=1
                 )
-            
-            input_length = input_ids.shape[1]
-            generated_ids = outputs_tensor[0][input_length:]
+        
+            # The output includes the prompt, so we need to decode only the generated part.
+            # For apply_chat_template, the input_ids are the full prompt.
+            generated_ids = outputs_tensor[0][input_ids.shape[1]:]
             return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
         elif self.engine == "vllm":
             if self.llm is None: 
                  raise RuntimeError("vLLM engine not properly initialized before generation.")
-            
-            current_model_config = self.models[model_index]
+        
+            # Get tokenizer from vLLM engine
+            try:
+                tokenizer = self.llm.get_tokenizer()
+            except Exception as e:
+                # Fallback: try to load it manually if get_tokenizer() fails or not available
+                # This might happen if vLLM's LLM object doesn't expose it as expected in all versions/cases
+                print(f"Warning: self.llm.get_tokenizer() failed: {e}. Attempting manual load for vLLM prompt formatting.")
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                except Exception as e_load:
+                    raise RuntimeError(f"Failed to load tokenizer for vLLM ({model_path}): {e_load}")
+
+            # Apply chat template to get the prompt string for vLLM
+            prompt_string = tokenizer.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+        
             sampling_params = SamplingParams(
-                max_tokens=current_model_config.get("max_new_tokens", self.default_vllm_max_new_tokens),
+                max_tokens=configured_max_new_tokens,
                 temperature=0.0, 
                 top_p=1.0
             )
-            vllm_outputs = self.llm.generate([prompt], sampling_params)
+            vllm_outputs = self.llm.generate([prompt_string], sampling_params)
             return vllm_outputs[0].outputs[0].text.strip()
         else:
             raise ValueError(f"Unknown engine: {self.engine}")
@@ -534,18 +562,9 @@ class PIIRedactor:
             for model_idx, model_config in enumerate(self.models):
                 self._initialize_model(model_idx) # Ensures model is ready
                 
-                # Construct prompt for the current model
-                tags_for_prompt = ", ".join([tag.value for tag in model_config.get("tags", [])])
-                prompt = model_config["prompt_template_format_string"].format(
-                    tags_to_identify=tags_for_prompt,
-                    text_to_process=current_doc_text_for_processing
-                )
-
-                # Get raw output from the model
-                # _model_call now expects just the prompt for vLLM, and text for transformers
-                # We need to adjust _model_call or how we pass arguments if engines differ significantly in input needs beyond prompt
-                # For now, assuming _model_call handles the prompt correctly for its engine type
-                tagged_text = self._model_call(prompt, model_idx) # Pass the constructed prompt
+                # The prompt construction is now handled within _model_call using apply_chat_template
+                # Pass the raw text directly to _model_call
+                tagged_text = self._model_call(current_doc_text_for_processing, model_idx)
                 raw_model_outputs.append(tagged_text)
 
                 # Determine tags to include for apply_tags based on strict_apply_filter
@@ -584,7 +603,7 @@ class PIIRedactor:
             # For vLLM, the single LLM instance might hold the last model. 
             # Explicit unloading of the vLLM engine's model isn't typically done this way unless switching models frequently.
             # If all models are loaded into one vLLM engine instance (not supported by current _initialize_model for multiple vLLM models)
-            # then unloading is different. Current code implies one vLLM model loaded at a time if engine is vLLM.
+            # then unloading is different. Current code implies one vLLM model loaded at a time if engine is vllm.
             # Let's assume _unload_model handles the vLLM case if needed, or it's managed by PIIRedactor lifecycle.
             pass # Or specific vLLM unload if PIIRedactor instance is being destroyed.
 
