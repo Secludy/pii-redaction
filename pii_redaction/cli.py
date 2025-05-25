@@ -56,6 +56,13 @@ def main():
     jsonl_parser.add_argument(
         "--device", help="Device to use for processing (e.g., cuda, cpu)"
     )
+    jsonl_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of JSON objects (lines) to read from input and process in one batch. "
+             "Larger values can improve throughput for vLLM engine."
+    )
     add_pii_handling_args(jsonl_parser)
 
     # Process text files command
@@ -72,6 +79,9 @@ def main():
     args = parser.parse_args()
 
     if args.command == "process-jsonl":
+        if args.batch_size <= 0:
+            print(f"Error: --batch-size must be a positive integer.", file=sys.stderr)
+            sys.exit(1)
         clean_dataset(
             args.input,
             args.output,
@@ -79,6 +89,7 @@ def main():
             engine=args.engine,
             mode=args.mode,
             locale=args.locale,
+            batch_size=args.batch_size
         )
     elif args.command == "process-text":
         with open(args.input, "r") as f:
