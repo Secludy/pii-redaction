@@ -176,7 +176,16 @@ def apply_tags(
     for tstr, include_tags in zip(tagged_strings, tags_to_include):
         cleaned, annotations = parse_tagged_string(tstr)
         for ann_start, ann_end, tag, text in annotations: # 'tag' here is a string from the parser
-            # 'include_tags' is a list of PIIType enum members for the current model.
+            # Debug prints
+            print(f"DEBUG: apply_tags - Current tag from parser: {tag} (type: {type(tag)})")
+            print(f"DEBUG: apply_tags - include_tags for this model output: {include_tags} (type: {type(include_tags)})")
+            if hasattr(include_tags, '__iter__') and not isinstance(include_tags, str):
+                for item in include_tags:
+                    print(f"DEBUG: apply_tags - item in include_tags: {item} (type: {type(item)})")
+            else:
+                print(f"DEBUG: apply_tags - include_tags is NOT iterable or is a string.")
+
+            # 'include_tags' is expected to be a list of PIIType enum members for the current model.
             # We need to check if the string 'tag' matches the .value of any PIIType in include_tags.
             if include_tags is not None and tag not in [pii_type.value for pii_type in include_tags]:
                 continue # This was original line 179
@@ -187,7 +196,14 @@ def apply_tags(
             if orig_start == -1:
                 continue
             orig_end = orig_start + len(text)
-            candidate_annotations.append((orig_start, orig_end, tag, text))
+            candidate_annotations.append(
+                (
+                    orig_start,
+                    orig_end,
+                    tag,
+                    text,
+                )
+            )
 
     if mode == PIIHandlingMode.REPLACE:
         fake_generator = FakePIIGenerator(locale=locale)
