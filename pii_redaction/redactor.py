@@ -90,9 +90,10 @@ def parse_tagged_string(tagged_str):
                 closing_index = tagged_str.find(closing_tag, i)
 
                 if closing_index == -1:
-                    clean_str += tagged_str[i]
-                    clean_index += 1
-                    i += 1
+                    if i < len(tagged_str): 
+                        clean_str += tagged_str[i]
+                        clean_index += 1
+                        i += 1
                     continue
 
                 annotated_text = tagged_str[i:closing_index]
@@ -421,7 +422,8 @@ class PIIRedactor:
         Returns:
             str: The processed text with PII tags
         """
-        # self._initialize_model(model_index) # Initialization is now handled in tag_pii_in_documents loop
+        self._initialize_model(model_index) # Ensure the correct model is loaded
+
         model_config = self._get_model_config(model_index)
         model_path = model_config["path"]
 
@@ -487,9 +489,9 @@ class PIIRedactor:
             return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         elif self.engine == "vllm":
             if self.llm is None:
-                self._initialize_model(model_index) 
-                if self.llm is None:
-                    raise RuntimeError("vLLM engine not properly initialized before generation.")
+                # This should ideally not be reached if _initialize_model works correctly
+                # and raises its own error or handles the situation.
+                raise RuntimeError("vLLM engine failed to initialize or load the model.")
             
             current_model_config = self.models[model_index]
             sampling_params = SamplingParams(
