@@ -276,8 +276,14 @@ class PIIRedactor:
         tokenizer.pad_token = tokenizer.eos_token
 
         messages = [{"role": "user", "content": text}]
+        # ``apply_chat_template`` can return either a string or a tokenized
+        # representation depending on the ``transformers`` version.  VLLM
+        # expects the prompt as a plain string, so ensure we explicitly request
+        # an untokenized string.
         prompt = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, return_dict=False
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
         )
 
         if self.engine == "transformers":
