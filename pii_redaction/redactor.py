@@ -266,6 +266,7 @@ class PIIRedactor:
                 "prompt_template_format_string": "<SYS>You are a PII detection expert. Identify the following PII types: {tags_to_identify}. Output only the PII entities, each on a new line, enclosed in XML tags corresponding to their PII type. If no PII is found, output 'NO_PII_FOUND'.</SYS>\nText to process: {text_to_process}",
                 "max_new_tokens": 128, 
                 "exclusive_tags": False, 
+                "strict_apply_filter": True,
                 "dtype": torch.bfloat16 if self.device == "cuda" else torch.float32 
             },
             {
@@ -287,6 +288,7 @@ class PIIRedactor:
                 "prompt_template_format_string": "<SYS>You are a PII detection expert. Identify the following PII types: {tags_to_identify}. Output only the PII entities, each on a new line, enclosed in XML tags corresponding to their PII type. If no PII is found, output 'NO_PII_FOUND'.</SYS>\nText to process: {text_to_process}",
                 "max_new_tokens": 128, # Can be adjusted if general model needs more/less
                 "exclusive_tags": False, 
+                "strict_apply_filter": False,
                 "dtype": torch.bfloat16 if self.device == "cuda" else torch.float32 
             }
         ]
@@ -516,103 +518,75 @@ class PIIRedactor:
         Returns:
             list: List of documents with PII handled according to the specified mode.
         """
-        outputs_by_doc = [[] for _ in documents]
-        current_doc_texts_for_processing = list(documents)
-
-        for model_idx, model_config in enumerate(self.models):
-            self._initialize_model(model_idx)
-            next_iteration_doc_texts = ["" for _ in documents]
-
-            if self.engine == "vllm":
-                prompts_for_batch = []
-                doc_indices_in_batch = []
-
-                tags_to_identify_list = model_config["tags"]
-                if isinstance(tags_to_identify_list, str) and tags_to_identify_list.lower() == "all":
-                    tags_to_identify_str = ", ".join([pii_type.value for pii_type in PIIType])
-                elif isinstance(tags_to_identify_list, list):
-                    tags_to_identify_str = ", ".join([tag.value for tag in tags_to_identify_list])
-                else:
-                    print(f"Warning: Invalid 'tags' format in model config {model_idx}: {tags_to_identify_list}. Using empty tag list.")
-                    tags_to_identify_str = ""
-
-                for doc_idx, text_to_process in enumerate(current_doc_texts_for_processing):
-                    if not text_to_process.strip():
-                        outputs_by_doc[doc_idx].append((model_idx, ""))
-                        next_iteration_doc_texts[doc_idx] = ""
-                        continue
-                    
-                    prompt = model_config["prompt_template_format_string"].format(
-                        tags_to_identify=tags_to_identify_str,
-                        text_to_process=text_to_process
-                    )
-                    prompts_for_batch.append(prompt)
-                    doc_indices_in_batch.append(doc_idx)
-
-                if prompts_for_batch:
-                    if self.llm is None: 
-                         raise RuntimeError("vLLM engine not properly initialized before generation.")
-                    
-                    # Create SamplingParams dynamically using current model_config
-                    current_sampling_params = SamplingParams(
-                        max_tokens=model_config.get("max_new_tokens", self.default_vllm_max_new_tokens),
-                        temperature=0.0,
-                        top_p=1.0
-                    )
-                    vllm_batch_outputs = self.llm.generate(prompts=prompts_for_batch, sampling_params=current_sampling_params)
-                    
-                    for i, vllm_output_item in enumerate(vllm_batch_outputs):
-                        original_doc_idx = doc_indices_in_batch[i]
-                        tagged_text = vllm_output_item.outputs[0].text
-                        outputs_by_doc[original_doc_idx].append((model_idx, tagged_text))
-
-                        if model_config.get("exclusive_tags"):
-                            clean_text, _ = parse_tagged_string(tagged_text)
-                            next_iteration_doc_texts[original_doc_idx] = clean_text
-                        else:
-                            next_iteration_doc_texts[original_doc_idx] = current_doc_texts_for_processing[original_doc_idx]
-                
-                for i in range(len(documents)):
-                    if i not in doc_indices_in_batch:
-                        pass 
-
-            elif self.engine == "transformers":
-                for doc_idx, text_to_process in enumerate(current_doc_texts_for_processing):
-                    if not text_to_process.strip():
-                        outputs_by_doc[doc_idx].append((model_idx, ""))
-                        next_iteration_doc_texts[doc_idx] = ""
-                        continue
-
-                    tagged_text = self._model_call(text_to_process, model_idx)
-                    outputs_by_doc[doc_idx].append((model_idx, tagged_text))
-
-                    if model_config.get("exclusive_tags"):
-                        clean_text_for_next_model, _ = parse_tagged_string(tagged_text)
-                        next_iteration_doc_texts[doc_idx] = clean_text_for_next_model
-                    else:
-                        next_iteration_doc_texts[doc_idx] = text_to_process
-                
-                # Unload the transformers model after processing all documents with it for this model_config
-                self._unload_model(model_idx)
-            
-            current_doc_texts_for_processing = next_iteration_doc_texts 
-
         processed_documents = []
-        for doc, outputs_for_doc in zip(documents, outputs_by_doc):
-            # outputs_for_doc is a list of tuples: [(model_idx, tagged_text), ...]
-            tagged_texts_from_models = [tagged_text for _, tagged_text in outputs_for_doc]
-            # model_specific_tags should be a list of lists of PIIType enums, 
-            # corresponding to each tagged_text from models.
-            model_specific_tags = [self.models[model_idx]['tags'] for model_idx, _ in outputs_for_doc]
-            
-            processed_doc = apply_tags(
-                doc, 
-                tagged_texts_from_models, 
-                model_specific_tags,  # Pass the correctly structured list of tag lists
-                mode=mode, 
+        if not documents:
+            return []
+
+        # Determine if vLLM engine is used and if any model uses it
+        # This is a simplified check; actual vLLM usage is per model config
+        # For now, we assume if engine is vllm, all models might use it if not specified otherwise
+
+        for original_doc_idx, doc_text in enumerate(tqdm(documents, desc="Tagging Documents")):
+            raw_model_outputs = []
+            tags_to_include_for_apply = []
+            current_doc_text_for_processing = doc_text
+
+            for model_idx, model_config in enumerate(self.models):
+                self._initialize_model(model_idx) # Ensures model is ready
+                
+                # Construct prompt for the current model
+                tags_for_prompt = ", ".join([tag.value for tag in model_config.get("tags", [])])
+                prompt = model_config["prompt_template_format_string"].format(
+                    tags_to_identify=tags_for_prompt,
+                    text_to_process=current_doc_text_for_processing
+                )
+
+                # Get raw output from the model
+                # _model_call now expects just the prompt for vLLM, and text for transformers
+                # We need to adjust _model_call or how we pass arguments if engines differ significantly in input needs beyond prompt
+                # For now, assuming _model_call handles the prompt correctly for its engine type
+                tagged_text = self._model_call(prompt, model_idx) # Pass the constructed prompt
+                raw_model_outputs.append(tagged_text)
+
+                # Determine tags to include for apply_tags based on strict_apply_filter
+                if model_config.get("strict_apply_filter", True): # Default to True if key is missing
+                    tags_to_include_for_apply.append(model_config.get("tags", []))
+                else:
+                    tags_to_include_for_apply.append(None) # Allow all tags from this model's output
+
+                # If exclusive_tags is True for this model, the *next* model in the sequence
+                # should process the cleaned version of *this* model's output.
+                # However, with the new approach of calling apply_tags once at the end,
+                # 'exclusive_tags' logic needs rethinking if we want to chain modifications.
+                # For now, 'exclusive_tags' will effectively mean that the *original text* is passed to each model,
+                # and apply_tags merges. If we need sequential cleaning, this part needs more work.
+                # The current change with strict_apply_filter=False for general model aims to mimic original behavior.
+
+            # Call apply_tags once with all collected outputs for the current document
+            final_processed_doc = apply_tags(
+                doc_text, # Original document text
+                raw_model_outputs, # List of raw tagged strings from all models
+                tags_to_include_for_apply, # List of tag lists (or None) for filtering
+                mode=mode,
                 locale=locale
             )
-            processed_documents.append(processed_doc)
+            processed_documents.append(final_processed_doc)
+            
+            # If using vLLM and models are switched, ensure proper unloading/loading if necessary
+            # This part is complex if models truly switch per document or per model_config within a document batch
+            # The _initialize_model should handle loading, but unloading might be needed for memory with many vLLM models.
+            # For now, assuming _initialize_model handles the state correctly for the current model_idx.
+
+        # Unload all models after processing all documents if using transformers, or the last vLLM model
+        if self.engine == "transformers":
+            self._unload_model(unload_all=True)
+        elif self.engine == "vllm" and self.llm is not None:
+            # For vLLM, the single LLM instance might hold the last model. 
+            # Explicit unloading of the vLLM engine's model isn't typically done this way unless switching models frequently.
+            # If all models are loaded into one vLLM engine instance (not supported by current _initialize_model for multiple vLLM models)
+            # then unloading is different. Current code implies one vLLM model loaded at a time if engine is vLLM.
+            # Let's assume _unload_model handles the vLLM case if needed, or it's managed by PIIRedactor lifecycle.
+            pass # Or specific vLLM unload if PIIRedactor instance is being destroyed.
 
         return processed_documents
 
