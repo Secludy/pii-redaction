@@ -175,11 +175,13 @@ def apply_tags(
 
     for tstr, include_tags in zip(tagged_strings, tags_to_include):
         cleaned, annotations = parse_tagged_string(tstr)
-        for ann_start, ann_end, tag, text in annotations:
-            if include_tags != None and tag not in include_tags:
-                continue
+        for ann_start, ann_end, tag, text in annotations: # 'tag' here is a string from the parser
+            # 'include_tags' is a list of PIIType enum members for the current model.
+            # We need to check if the string 'tag' matches the .value of any PIIType in include_tags.
+            if include_tags is not None and tag not in [pii_type.value for pii_type in include_tags]:
+                continue # This was original line 179
 
-            rel = ann_start / len(cleaned) if cleaned else 0
+            rel = ann_start / len(cleaned) if cleaned else 0 # This was original line 181
             start_hint = int(rel * len(original))
             orig_start = find_best_match(text, original, start_hint)
             if orig_start == -1:
@@ -488,10 +490,8 @@ class PIIRedactor:
             generated_ids = outputs_tensor[0][input_length:]
             return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         elif self.engine == "vllm":
-            if self.llm is None:
-                # This should ideally not be reached if _initialize_model works correctly
-                # and raises its own error or handles the situation.
-                raise RuntimeError("vLLM engine failed to initialize or load the model.")
+            if self.llm is None: 
+                 raise RuntimeError("vLLM engine not properly initialized before generation.")
             
             current_model_config = self.models[model_index]
             sampling_params = SamplingParams(
