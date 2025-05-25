@@ -212,12 +212,13 @@ def apply_tags(
 
 
 class PIIRedactor:
-    def __init__(self, device=None):
+    def __init__(self, device=None, engine="transformers"):
         """
         Initialize the PIIRedactor with models for PII detection.
 
         Args:
             device (str): Device to use for inference (e.g., 'cuda', 'cpu')
+            engine (str): Backend to use for generation ('transformers' or 'vllm')
         """
 
         self.model_paths = ["OpenPipe/Pii-Redact-Name", "OpenPipe/Pii-Redact-General"]
@@ -226,6 +227,7 @@ class PIIRedactor:
         )
 
         self.device = device
+        self.engine = engine
 
         self.models = [None] * len(self.model_paths)
         self.tokenizers = [None] * len(self.model_paths)
@@ -233,18 +235,26 @@ class PIIRedactor:
     def _initialize_model(self, index):
         """Initialize a specific model if it hasn't been already."""
         if self.models[index] is None:
-            self.models[index] = AutoModelForCausalLM.from_pretrained(
-                self.model_paths[index]
-            )
-            self.tokenizers[index] = AutoTokenizer.from_pretrained(
-                self.model_paths[index], padding_side="left"
-            )
-            self.tokenizers[index].padding_side = "left"
+            if self.engine == "transformers":
+                self.models[index] = AutoModelForCausalLM.from_pretrained(
+                    self.model_paths[index]
+                )
+                self.tokenizers[index] = AutoTokenizer.from_pretrained(
+                    self.model_paths[index], padding_side="left"
+                )
+                self.tokenizers[index].padding_side = "left"
 
-            if self.device:
-                self.models[index] = self.models[index].to(self.device)
-            elif torch.cuda.is_available():
-                self.models[index] = self.models[index].to("cuda")
+                if self.device:
+                    self.models[index] = self.models[index].to(self.device)
+                elif torch.cuda.is_available():
+                    self.models[index] = self.models[index].to("cuda")
+            elif self.engine == "vllm":
+                from vllm import LLM
+                self.models[index] = LLM(model=self.model_paths[index])
+                self.tokenizers[index] = AutoTokenizer.from_pretrained(
+                    self.model_paths[index], padding_side="left"
+                )
+                self.tokenizers[index].padding_side = "left"
 
     def _model_call(self, text, model_index):
         """
@@ -266,25 +276,32 @@ class PIIRedactor:
         tokenizer.pad_token = tokenizer.eos_token
 
         messages = [{"role": "user", "content": text}]
-
-        encoded_input = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, return_dict=True, return_tensors="pt"
+        prompt = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_dict=False
         )
 
-        input_ids = encoded_input["input_ids"].to(model.device)
-        attention_mask = encoded_input["attention_mask"].to(model.device)
+        if self.engine == "transformers":
+            encoded_input = tokenizer(prompt, return_tensors="pt")
+            input_ids = encoded_input["input_ids"].to(model.device)
+            attention_mask = encoded_input["attention_mask"].to(model.device)
 
-        with torch.no_grad():
-            outputs = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=1024,
-                pad_token_id=tokenizer.eos_token_id,
-            )
+            with torch.no_grad():
+                outputs = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=1024,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
 
-        input_length = encoded_input["input_ids"].size(1)
-        generated_ids = outputs[0][input_length:]
-        return tokenizer.decode(generated_ids, skip_special_tokens=True)
+            input_length = encoded_input["input_ids"].size(1)
+            generated_ids = outputs[0][input_length:]
+            return tokenizer.decode(generated_ids, skip_special_tokens=True)
+        else:  # vllm engine
+            from vllm import SamplingParams
+
+            sampling_params = SamplingParams(max_tokens=1024)
+            outputs = model.generate([prompt], sampling_params)
+            return outputs[0].outputs[0].text
 
     def tag_pii_in_documents(self, documents, mode=PIIHandlingMode.TAG, locale="en_US"):
         """
@@ -319,7 +336,11 @@ class PIIRedactor:
 
 
 def tag_pii_in_documents(
-    documents, device=None, mode=PIIHandlingMode.TAG, locale="en_US"
+    documents,
+    device=None,
+    engine="transformers",
+    mode=PIIHandlingMode.TAG,
+    locale="en_US",
 ):
     """
     Convenience function to process a list of documents through a PII tagging model.
@@ -327,6 +348,7 @@ def tag_pii_in_documents(
     Args:
         documents (list): List of text documents to process.
         device (str): Device to use for processing (e.g., 'cuda', 'cpu').
+        engine (str): Backend to use for generation ('transformers' or 'vllm').
         mode (PIIHandlingMode): How to handle identified PII:
             - TAG: Keep PII with XML tags
             - REDACT: Replace PII with empty tags
@@ -336,7 +358,7 @@ def tag_pii_in_documents(
     Returns:
         list: List of documents with PII handled according to the specified mode.
     """
-    redactor = PIIRedactor(device=device)
+    redactor = PIIRedactor(device=device, engine=engine)
     return redactor.tag_pii_in_documents(documents, mode=mode, locale=locale)
 
 
@@ -344,6 +366,7 @@ def clean_dataset(
     input_filename,
     output_filename,
     device=None,
+    engine="transformers",
     mode=PIIHandlingMode.TAG,
     locale="en_US",
 ):
@@ -356,13 +379,14 @@ def clean_dataset(
         input_filename (str): Path to the input JSONL file.
         output_filename (str): Path to the output JSONL file.
         device (str): Device to use for processing (e.g., 'cuda', 'cpu').
+        engine (str): Backend to use for generation ('transformers' or 'vllm').
         mode (PIIHandlingMode): How to handle identified PII:
             - TAG: Keep PII with XML tags
             - REDACT: Replace PII with empty tags
             - REPLACE: Replace PII with fake data
         locale (str): Locale for generating fake data (only used if mode=REPLACE)
     """
-    redactor = PIIRedactor(device=device)
+    redactor = PIIRedactor(device=device, engine=engine)
 
     with open(input_filename, "r") as f:
         num_lines = sum(1 for line in f)
