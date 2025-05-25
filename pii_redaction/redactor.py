@@ -271,30 +271,22 @@ class PIIRedactor:
             {
                 "path": "OpenPipe/Pii-Redact-General", 
                 "tags": [
-                    PIIType.LOCATION,
+                    PIIType.STREET_ADDRESS,
                     PIIType.PHONE_NUMBER,
                     PIIType.EMAIL_ADDRESS,
-                    PIIType.CREDIT_CARD_INFO,
-                    PIIType.IP_ADDRESS,
-                    PIIType.DATE,
-                    PIIType.AGE,
-                    PIIType.NATIONALITY,
-                    PIIType.DATE_OF_BIRTH,
-                    PIIType.DOMAIN_NAME,
-                    PIIType.DEMOGRAPHIC_GROUP,
-                    PIIType.GENDER,
                     PIIType.PERSONAL_ID,
                     PIIType.OTHER_ID,
+                    PIIType.CREDIT_CARD_INFO,
+                    PIIType.DATE_OF_BIRTH,
                     PIIType.BANKING_NUMBER,
                     PIIType.MEDICAL_CONDITION,
-                    PIIType.STREET_ADDRESS,
                     PIIType.PASSWORD,
                     PIIType.SECURE_CREDENTIAL,
                     PIIType.RELIGIOUS_AFFILIATION
                 ],
                 "prompt_template_format_string": "<SYS>You are a PII detection expert. Identify the following PII types: {tags_to_identify}. Output only the PII entities, each on a new line, enclosed in XML tags corresponding to their PII type. If no PII is found, output 'NO_PII_FOUND'.</SYS>\nText to process: {text_to_process}",
                 "max_new_tokens": 128, # Can be adjusted if general model needs more/less
-                "exclusive_tags": True, 
+                "exclusive_tags": False, 
                 "dtype": torch.bfloat16 if self.device == "cuda" else torch.float32 
             }
         ]
