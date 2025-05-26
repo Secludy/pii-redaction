@@ -534,78 +534,97 @@ class PIIRedactor:
     def tag_pii_in_documents(self, documents, mode=PIIHandlingMode.TAG, locale="en_US"):
         """
         Process a list of documents to identify and handle PII according to the specified mode.
-
         Args:
             documents (list): List of text documents to process.
-            mode (PIIHandlingMode): How to handle identified PII:
-                - TAG: Keep PII with XML tags
-                - REDACT: Replace PII with empty tags
-                - REPLACE: Replace PII with fake data
-            locale (str): Locale for generating fake data (only used if mode=REPLACE)
-
+            mode (PIIHandlingMode): How to handle identified PII.
+            locale (str): Locale for generating fake data.
         Returns:
-            list: List of documents with PII handled according to the specified mode.
+            list: List of documents with PII handled.
         """
-        processed_documents = []
         if not documents:
             return []
 
-        # Determine if vLLM engine is used and if any model uses it
-        # This is a simplified check; actual vLLM usage is per model config
-        # For now, we assume if engine is vllm, all models might use it if not specified otherwise
+        num_documents = len(documents)
+        # Initialize a list of lists to store raw model outputs for each document
+        # E.g., all_doc_raw_outputs[doc_idx][model_idx] = "tagged_text_from_model"
+        all_doc_raw_outputs = [[None] * len(self.models) for _ in range(num_documents)]
+        # Store the tags_to_include_for_apply for each model once
+        model_tags_for_apply_config = [] 
 
-        for original_doc_idx, doc_text in enumerate(tqdm(documents, desc="Tagging Documents")):
-            raw_model_outputs = []
-            tags_to_include_for_apply = []
-            current_doc_text_for_processing = doc_text
+        # Optimized loop order: iterate through models first, then documents
+        # This is especially beneficial for vLLM to avoid frequent model reloads.
+        for model_idx, model_config in enumerate(self.models):
+            self._initialize_model(model_idx) # Load/ensure current model is ready
+            
+            # Determine tags_to_include_for_apply for this model once
+            if model_config.get("strict_apply_filter", True):
+                model_tags_for_apply_config.append(model_config.get("tags", []))
+            else:
+                model_tags_for_apply_config.append(None) 
 
-            for model_idx, model_config in enumerate(self.models):
-                self._initialize_model(model_idx) # Ensures model is ready
+            # Prepare texts for batch processing if engine supports it (vLLM does)
+            # For transformers, _model_call processes one by one, but model is kept loaded.
+            texts_to_process_for_current_model = []
+            doc_indices_for_current_batch = [] # Keep track of original doc indices
+
+            for doc_idx, doc_text in enumerate(documents):
+                # In the previous version, current_doc_text_for_processing could change if exclusive_tags=True.
+                # With the new loop order, each model always sees the original doc_text for simplicity and consistency.
+                # If true sequential processing (output of model A becomes input of model B) is needed with this loop order,
+                # it would require more complex state management across model iterations.
+                # For now, all models operate on the original document text.
+                current_doc_text_for_processing = doc_text
                 
-                # The prompt construction is now handled within _model_call using apply_chat_template
-                # Pass the raw text directly to _model_call
-                tagged_text = self._model_call(current_doc_text_for_processing, model_idx)
-                raw_model_outputs.append(tagged_text)
+                if self.engine == "vllm":
+                    # For vLLM, collect all texts to process them in a batch with the current model
+                    texts_to_process_for_current_model.append(current_doc_text_for_processing)
+                    doc_indices_for_current_batch.append(doc_idx)
+                else: # transformers engine, process one by one
+                    tagged_text = self._model_call(current_doc_text_for_processing, model_idx)
+                    all_doc_raw_outputs[doc_idx][model_idx] = tagged_text
+            
+            # If vLLM, process the batch for the current model
+            if self.engine == "vllm" and texts_to_process_for_current_model:
+                # _model_call for vLLM needs to be adapted to handle a batch of texts if we want to call it once.
+                # Or, we call it multiple times but vLLM internally batches if llm.generate gets a list.
+                # The current _model_call expects a single raw_text_to_process.
+                # Let's assume _model_call is called per text, and vLLM's llm.generate handles batching if prompts is a list.
+                # For simplicity and to reuse _model_call, we'll call it iteratively here.
+                # A more optimized vLLM batch call would involve modifying _model_call or llm.generate directly with a list.
+                # However, the primary gain is from loading the vLLM model once per model_config.
+                for i, text_to_process in enumerate(tqdm(texts_to_process_for_current_model, desc=f"Model {model_idx+1}/{len(self.models)}")):
+                    original_doc_idx = doc_indices_for_current_batch[i]
+                    tagged_text = self._model_call(text_to_process, model_idx) # model_idx ensures correct vLLM model is used
+                    all_doc_raw_outputs[original_doc_idx][model_idx] = tagged_text
 
-                # Determine tags to include for apply_tags based on strict_apply_filter
-                if model_config.get("strict_apply_filter", True): # Default to True if key is missing
-                    tags_to_include_for_apply.append(model_config.get("tags", []))
-                else:
-                    tags_to_include_for_apply.append(None) # Allow all tags from this model's output
+            if self.engine == "transformers":
+                self._unload_model(model_idx) # Unload transformers model if not needed by next model_config (if paths differ)
+                                            # Or better, unload all at the end if PIIRedactor instance is done.
+                                            # Current _unload_model unloads by path, so this is okay.
 
-                # If exclusive_tags is True for this model, the *next* model in the sequence
-                # should process the cleaned version of *this* model's output.
-                # However, with the new approach of calling apply_tags once at the end,
-                # 'exclusive_tags' logic needs rethinking if we want to chain modifications.
-                # For now, 'exclusive_tags' will effectively mean that the *original text* is passed to each model,
-                # and apply_tags merges. If we need sequential cleaning, this part needs more work.
-                # The current change with strict_apply_filter=False for general model aims to mimic original behavior.
-
-            # Call apply_tags once with all collected outputs for the current document
+        # After all models have processed all documents, apply tags for each document
+        processed_documents = []
+        for doc_idx, original_doc_text in enumerate(tqdm(documents, desc="Applying Tags")):
+            raw_outputs_for_this_doc = all_doc_raw_outputs[doc_idx]
+            
             final_processed_doc = apply_tags(
-                doc_text, # Original document text
-                raw_model_outputs, # List of raw tagged strings from all models
-                tags_to_include_for_apply, # List of tag lists (or None) for filtering
+                original_doc_text,          # Original document text
+                raw_outputs_for_this_doc,   # List of raw tagged strings from all models for this doc
+                model_tags_for_apply_config,# List of tag lists (or None) for filtering, same for all docs
                 mode=mode,
                 locale=locale
             )
             processed_documents.append(final_processed_doc)
-            
-            # If using vLLM and models are switched, ensure proper unloading/loading if necessary
-            # This part is complex if models truly switch per document or per model_config within a document batch
-            # The _initialize_model should handle loading, but unloading might be needed for memory with many vLLM models.
-            # For now, assuming _initialize_model handles the state correctly for the current model_idx.
-
-        # Unload all models after processing all documents if using transformers, or the last vLLM model
+        
+        # Final cleanup of models
         if self.engine == "transformers":
-            self._unload_model(unload_all=True)
+            self._unload_model(unload_all=True) # Unload all transformers models
         elif self.engine == "vllm" and self.llm is not None:
-            # For vLLM, the single LLM instance might hold the last model. 
-            # Explicit unloading of the vLLM engine's model isn't typically done this way unless switching models frequently.
-            # If all models are loaded into one vLLM engine instance (not supported by current _initialize_model for multiple vLLM models)
-            # then unloading is different. Current code implies one vLLM model loaded at a time if engine is vllm.
-            # Let's assume _unload_model handles the vLLM case if needed, or it's managed by PIIRedactor lifecycle.
-            pass # Or specific vLLM unload if PIIRedactor instance is being destroyed.
+            # The vLLM model (the last one used) is still in self.llm.
+            # We can delete it here if the PIIRedactor instance is done.
+            # For now, let's assume it's managed by PIIRedactor lifecycle (e.g., in a __del__ or explicit close method)
+            # or unloaded if a different vLLM model is initialized next time.
+            pass
 
         return processed_documents
 
