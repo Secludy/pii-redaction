@@ -412,26 +412,28 @@ class PIIRedactor:
                     self.llm = None
                     self.current_vllm_model_path = None
 
-    def _model_call(self, raw_text_to_process, model_index):
+    def _model_call(self, raw_text_input, model_index):
         """
         Process text through a specific model to identify PII entities.
 
         Args:
-            raw_text_to_process (str): The raw text to process.
+            raw_text_input (str or list[str]): The raw text(s) to process.
             model_index (int): Index of the model config to use.
 
         Returns:
-            str: The processed text with PII tags
+            str or list[str]: The processed text(s) with PII tags, matching input type.
         """
         self._initialize_model(model_index) # Ensure the correct model is loaded
 
         model_config = self._get_model_config(model_index)
         model_path = model_config["path"]
-        configured_max_new_tokens = model_config.get("max_new_tokens", 1024) # Default to 1024
-
-        messages = [{"role": "user", "content": raw_text_to_process}]
+        configured_max_new_tokens = model_config.get("max_new_tokens", 1024)
 
         if self.engine == "transformers":
+            if not isinstance(raw_text_input, str):
+                raise TypeError(f"Transformers engine expects a single string for raw_text_input, got {type(raw_text_input)}")
+        
+            messages = [{"role": "user", "content": raw_text_input}]
             if model_path not in self.loaded_models or self.loaded_models[model_path] is None:
                 raise RuntimeError(f"Transformers model {model_path} not initialized before _model_call.")
         
@@ -439,62 +441,42 @@ class PIIRedactor:
             model = model_data["model"]
             tokenizer = model_data["tokenizer"]
         
-            # Apply chat template and tokenize
             try:
-                # Some tokenizers might not support add_generation_prompt directly in apply_chat_template
-                # or expect it to be handled differently. Standard practice is to include it.
                 encoded_input = tokenizer.apply_chat_template(
-                    messages, 
-                    tokenize=True, 
-                    add_generation_prompt=True, # Important for generation
-                    return_tensors="pt"
+                    messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
                 )
             except Exception as e:
-                # Fallback or simpler application if the above fails (e.g. older tokenizer versions)
                 print(f"Warning: tokenizer.apply_chat_template with add_generation_prompt failed: {e}. Falling back.")
-                # This fallback might be model-specific. For now, a common alternative:
                 prompt_str = tokenizer.decode(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True))
-                encoded_input = tokenizer(prompt_str, return_tensors="pt", truncation=True, max_length=tokenizer.model_max_length if hasattr(tokenizer, 'model_max_length') else 2048)
+                encoded_input = tokenizer(prompt_str, return_tensors="pt", truncation=True, max_length=getattr(tokenizer, 'model_max_length', 2048))
 
             input_ids = encoded_input["input_ids"].to(model.device)
-            # attention_mask might not be returned by apply_chat_template if tokenize=True for some versions/models
-            # or it might be part of encoded_input. If not, generate() can often infer it for causal LMs.
             attention_mask = encoded_input.get("attention_mask") 
             if attention_mask is not None:
                 attention_mask = attention_mask.to(model.device)
         
-            # Ensure prompt is not longer than model's capacity - this check is less direct with apply_chat_template
-            # as the template itself adds tokens. The tokenizer's truncation (if applied above) should handle it.
             prompt_token_length = input_ids.shape[1]
             effective_max_len = getattr(tokenizer, 'model_max_length', 2048)
 
             if prompt_token_length >= effective_max_len:
                 print(f"Warning: Input length ({prompt_token_length}) after chat template potentially exceeds model max length ({effective_max_len}). Output might be compromised.")
-                # actual_max_new_tokens might become 0 or negative if not handled.
 
-            # Use configured_max_new_tokens, ensuring it doesn't exceed model capacity given prompt length
-            # This calculation might need adjustment if truncation is handled by tokenizer.apply_chat_template or generate
-            allowable_max_new = max(0, effective_max_len - prompt_token_length - 5) # -5 for safety margin
+            allowable_max_new = max(0, effective_max_len - prompt_token_length - 5)
             actual_max_new_tokens = min(configured_max_new_tokens, allowable_max_new)
 
             if actual_max_new_tokens <= 0 and prompt_token_length < effective_max_len:
-                 # If allowable_max_new is zero due to prompt length, but there's technically space
-                 actual_max_new_tokens = configured_max_new_tokens # Try with configured, model.generate might truncate if needed
+                 actual_max_new_tokens = configured_max_new_tokens 
             elif actual_max_new_tokens <= 0:
                 print(f"Warning: No space for new tokens. Prompt length {prompt_token_length}, model max {effective_max_len}. Returning empty string.")
                 return "" 
 
             with torch.no_grad():
                 outputs_tensor = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask, # Pass attention_mask if available
-                    max_new_tokens=actual_max_new_tokens,
-                    pad_token_id=tokenizer.eos_token_id,
+                    input_ids=input_ids, attention_mask=attention_mask,
+                    max_new_tokens=actual_max_new_tokens, pad_token_id=tokenizer.eos_token_id,
                     temperature=0.0, top_p=1.0, num_beams=1
                 )
         
-            # The output includes the prompt, so we need to decode only the generated part.
-            # For apply_chat_template, the input_ids are the full prompt.
             generated_ids = outputs_tensor[0][input_ids.shape[1]:]
             return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
@@ -502,34 +484,74 @@ class PIIRedactor:
             if self.llm is None: 
                  raise RuntimeError("vLLM engine not properly initialized before generation.")
         
-            # Get tokenizer from vLLM engine
+            is_batch = isinstance(raw_text_input, list)
+            texts_to_batch = raw_text_input if is_batch else [raw_text_input]
+
             try:
                 tokenizer = self.llm.get_tokenizer()
             except Exception as e:
-                # Fallback: try to load it manually if get_tokenizer() fails or not available
-                # This might happen if vLLM's LLM object doesn't expose it as expected in all versions/cases
                 print(f"Warning: self.llm.get_tokenizer() failed: {e}. Attempting manual load for vLLM prompt formatting.")
                 try:
                     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
                 except Exception as e_load:
                     raise RuntimeError(f"Failed to load tokenizer for vLLM ({model_path}): {e_load}")
 
-            # Apply chat template to get the prompt string for vLLM
-            prompt_string = tokenizer.apply_chat_template(
-                messages, 
-                tokenize=False, 
-                add_generation_prompt=True
-            )
+            prompt_strings = []
+            for text_item in texts_to_batch:
+                messages = [{"role": "user", "content": text_item}]
+                prompt_strings.append(
+                    tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                )
         
             sampling_params = SamplingParams(
                 max_tokens=configured_max_new_tokens,
                 temperature=0.0, 
                 top_p=1.0
             )
-            vllm_outputs = self.llm.generate([prompt_string], sampling_params)
-            return vllm_outputs[0].outputs[0].text.strip()
+        
+            vllm_batch_outputs = self.llm.generate(prompt_strings, sampling_params)
+        
+            results = [output_item.outputs[0].text.strip() for output_item in vllm_batch_outputs]
+        
+            return results if is_batch else results[0]
         else:
             raise ValueError(f"Unknown engine: {self.engine}")
+
+    def _unload_model(self, model_index=None, unload_all=False):
+        if unload_all:
+            if self.engine == "transformers":
+                for model_path in self.loaded_models:
+                    del self.loaded_models[model_path]["model"]
+                    del self.loaded_models[model_path]["tokenizer"]
+                    self.loaded_models[model_path] = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            elif self.engine == "vllm":
+                if self.llm is not None:
+                    del self.llm
+                    if self.device == "cuda":
+                        torch.cuda.empty_cache()
+                    self.llm = None
+                    self.current_vllm_model_path = None
+        else:
+            if self.engine == "transformers":
+                model_config = self._get_model_config(model_index)
+                model_path = model_config["path"]
+                if model_path in self.loaded_models and self.loaded_models[model_path] is not None:
+                    del self.loaded_models[model_path]["model"]
+                    del self.loaded_models[model_path]["tokenizer"]
+                    self.loaded_models[model_path] = None
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            elif self.engine == "vllm":
+                if self.llm is not None and model_index == 0: 
+                    del self.llm
+                    if self.device == "cuda":
+                        torch.cuda.empty_cache()
+                    self.llm = None
+                    self.current_vllm_model_path = None
 
     def tag_pii_in_documents(self, documents, mode=PIIHandlingMode.TAG, locale="en_US"):
         """
@@ -553,8 +575,9 @@ class PIIRedactor:
 
         # Optimized loop order: iterate through models first, then documents
         # This is especially beneficial for vLLM to avoid frequent model reloads.
-        for model_idx, model_config in enumerate(self.models):
+        for model_idx, model_config in enumerate(tqdm(self.models, desc="Processing Models")):
             self._initialize_model(model_idx) # Load/ensure current model is ready
+            model_name = model_config.get("path", f"Model {model_idx+1}")
             
             # Determine tags_to_include_for_apply for this model once
             if model_config.get("strict_apply_filter", True):
@@ -562,184 +585,46 @@ class PIIRedactor:
             else:
                 model_tags_for_apply_config.append(None) 
 
-            # Prepare texts for batch processing if engine supports it (vLLM does)
-            # For transformers, _model_call processes one by one, but model is kept loaded.
             texts_to_process_for_current_model = []
             doc_indices_for_current_batch = [] # Keep track of original doc indices
 
             for doc_idx, doc_text in enumerate(documents):
-                # In the previous version, current_doc_text_for_processing could change if exclusive_tags=True.
-                # With the new loop order, each model always sees the original doc_text for simplicity and consistency.
-                # If true sequential processing (output of model A becomes input of model B) is needed with this loop order,
-                # it would require more complex state management across model iterations.
-                # For now, all models operate on the original document text.
                 current_doc_text_for_processing = doc_text
                 
                 if self.engine == "vllm":
-                    # For vLLM, collect all texts to process them in a batch with the current model
                     texts_to_process_for_current_model.append(current_doc_text_for_processing)
                     doc_indices_for_current_batch.append(doc_idx)
-                else: # transformers engine, process one by one
+                else: # transformers engine, process one by one (add tqdm here for user feedback)
+                    if doc_idx == 0: # Setup tqdm for transformers on first doc for this model
+                        print(f"Processing documents with Transformers model: {model_name}")
+                        transformer_doc_iterator = tqdm(enumerate(documents), total=num_documents, desc=f"Docs for {model_name}")
+                    
+                    # This loop structure for transformers needs adjustment.
+                    # The current outer loop is by model, then by document for collecting texts_to_process.
+                    # For transformers, we should process here directly.
+                    # The refactor below will adjust this section.
+                    pass # Placeholder, will be addressed in the next section of this edit
+            
+            # Process collected texts
+            if self.engine == "vllm":
+                if texts_to_process_for_current_model:
+                    print(f"Submitting batch of {len(texts_to_process_for_current_model)} documents to vLLM model: {model_name}")
+                    batch_results = self._model_call(texts_to_process_for_current_model, model_idx)
+                    for i, tagged_text in enumerate(batch_results):
+                        original_doc_idx = doc_indices_for_current_batch[i]
+                        all_doc_raw_outputs[original_doc_idx][model_idx] = tagged_text
+            elif self.engine == "transformers":
+                # Correct processing loop for transformers within the model-first iteration
+                print(f"Processing documents with Transformers model: {model_name}")
+                for doc_idx, doc_text in tqdm(enumerate(documents), total=num_documents, desc=f"Docs for {model_name}"):
+                    current_doc_text_for_processing = doc_text # Each model sees original text
                     tagged_text = self._model_call(current_doc_text_for_processing, model_idx)
                     all_doc_raw_outputs[doc_idx][model_idx] = tagged_text
-            
-            # If vLLM, process the batch for the current model
-            if self.engine == "vllm" and texts_to_process_for_current_model:
-                # _model_call for vLLM needs to be adapted to handle a batch of texts if we want to call it once.
-                # Or, we call it multiple times but vLLM internally batches if llm.generate gets a list.
-                # The current _model_call expects a single raw_text_to_process.
-                # Let's assume _model_call is called per text, and vLLM's llm.generate handles batching if prompts is a list.
-                # For simplicity and to reuse _model_call, we'll call it iteratively here.
-                # A more optimized vLLM batch call would involve modifying _model_call or llm.generate directly with a list.
-                # However, the primary gain is from loading the vLLM model once per model_config.
-                for i, text_to_process in enumerate(tqdm(texts_to_process_for_current_model, desc=f"Model {model_idx+1}/{len(self.models)}")):
-                    original_doc_idx = doc_indices_for_current_batch[i]
-                    tagged_text = self._model_call(text_to_process, model_idx) # model_idx ensures correct vLLM model is used
-                    all_doc_raw_outputs[original_doc_idx][model_idx] = tagged_text
 
             if self.engine == "transformers":
-                self._unload_model(model_idx) # Unload transformers model if not needed by next model_config (if paths differ)
-                                            # Or better, unload all at the end if PIIRedactor instance is done.
-                                            # Current _unload_model unloads by path, so this is okay.
-
-        # After all models have processed all documents, apply tags for each document
-        processed_documents = []
-        for doc_idx, original_doc_text in enumerate(tqdm(documents, desc="Applying Tags")):
-            raw_outputs_for_this_doc = all_doc_raw_outputs[doc_idx]
-            
-            final_processed_doc = apply_tags(
-                original_doc_text,          # Original document text
-                raw_outputs_for_this_doc,   # List of raw tagged strings from all models for this doc
-                model_tags_for_apply_config,# List of tag lists (or None) for filtering, same for all docs
-                mode=mode,
-                locale=locale
-            )
-            processed_documents.append(final_processed_doc)
-        
-        # Final cleanup of models
-        if self.engine == "transformers":
-            self._unload_model(unload_all=True) # Unload all transformers models
-        elif self.engine == "vllm" and self.llm is not None:
-            # The vLLM model (the last one used) is still in self.llm.
-            # We can delete it here if the PIIRedactor instance is done.
-            # For now, let's assume it's managed by PIIRedactor lifecycle (e.g., in a __del__ or explicit close method)
-            # or unloaded if a different vLLM model is initialized next time.
-            pass
-
-        return processed_documents
-
-
-def tag_pii_in_documents(
-    documents,
-    device=None,
-    engine="transformers",
-    mode=PIIHandlingMode.TAG,
-    locale="en_US",
-):
-    """
-    Convenience function to process a list of documents through a PII tagging model.
-
-    Args:
-        documents (list): List of text documents to process.
-        device (str): Device to use for processing (e.g., 'cuda', 'cpu').
-        engine (str): Backend to use for generation ('transformers' or 'vllm').
-        mode (PIIHandlingMode): How to handle identified PII:
-            - TAG: Keep PII with XML tags
-            - REDACT: Replace PII with empty tags
-            - REPLACE: Replace PII with fake data
-        locale (str): Locale for generating fake data (only used if mode=REPLACE)
-
-    Returns:
-        list: List of documents with PII handled according to the specified mode.
-    """
-    redactor = PIIRedactor(device=device, engine=engine)
-    return redactor.tag_pii_in_documents(documents, mode=mode, locale=locale)
-
-
-def clean_dataset(
-    input_filename,
-    output_filename,
-    device=None,
-    engine="transformers",
-    mode=PIIHandlingMode.TAG,
-    locale="en_US",
-    batch_size: int = 1 # Default to 1 for old behavior, CLI will pass larger for batching
-):
-    """
-    Reads a JSONL dataset and processes the 'content' field in each message.
-    Processes JSON objects in batches, updates them with the processed messages,
-    and writes them immediately to the output file.
-
-    Args:
-        input_filename (str): Path to the input JSONL file.
-        output_filename (str): Path to the output JSONL file.
-        device (str): Device to use for processing (e.g., 'cuda', 'cpu').
-        engine (str): Backend to use for generation ('transformers' or 'vllm').
-        mode (PIIHandlingMode): How to handle identified PII.
-        locale (str): Locale for generating fake data (only used if mode=REPLACE).
-        batch_size (int): Number of JSON objects (lines) to read and process in one batch.
-    """
-    redactor = PIIRedactor(device=device, engine=engine)
-
-    # Removed initial line counting for tqdm for performance with large files.
-    # tqdm will show iteration count and rate without total percentage.
-    with open(input_filename, "r") as fin, open(output_filename, "w") as fout:
-        json_objs_batch = []
-        for line in tqdm(fin, desc="Processing lines"):
-            try:
-                json_obj = json.loads(line.strip())
-                json_objs_batch.append(json_obj)
-            except json.JSONDecodeError as e:
-                print(f"Skipping line due to JSON decode error: {e}. Line: {line.strip()}")
-                continue # Skip this line and proceed to the next
-
-            if len(json_objs_batch) >= batch_size:
-                process_and_write_batch(
-                    json_objs_batch, fout, redactor, mode=mode, locale=locale
-                )
-                json_objs_batch = []  # Reset batch
-
-        # Process any remaining items in the last batch
-        if json_objs_batch:
-            process_and_write_batch(
-                json_objs_batch, fout, redactor, mode=mode, locale=locale
-            )
-
-
-def process_and_write_batch(
-    json_objs_batch, fout, redactor, mode=PIIHandlingMode.TAG, locale="en_US"
-):
-    """
-    Given a batch of JSON objects, extracts all messages, processes them,
-    updates the JSON objects, and writes them to the provided output file.
-
-    Args:
-        json_objs_batch (list): List of JSON objects.
-        fout (file object): Open output file to write processed JSON objects.
-        redactor (PIIRedactor): Redactor object to use for tagging.
-        mode (PIIHandlingMode): How to handle identified PII:
-            - TAG: Keep PII with XML tags
-            - REDACT: Replace PII with empty tags
-            - REPLACE: Replace PII with fake data
-        locale (str): Locale for generating fake data (only used if mode=REPLACE)
-    """
-    messages_to_process = []
-    for obj in json_objs_batch:
-        for message in obj.get("messages", []):
-            if message["content"]:
-                messages_to_process.append(message["content"])
-
-    processed_messages = redactor.tag_pii_in_documents(
-        messages_to_process, mode=mode, locale=locale
-    )
-
-    msg_idx = 0
-    for obj in json_objs_batch:
-        if "messages" in obj:
-            for i in range(len(obj["messages"])):
-                if obj["messages"][i]["content"]:
-                    obj["messages"][i]["content"] = processed_messages[msg_idx]
-                    msg_idx += 1
-
-        fout.write(json.dumps(obj) + "\n")
-    fout.flush()
+                # Unload transformers model if not needed by next model_config (if paths differ)
+                # This specific call might be too aggressive if models share paths or for overall efficiency.
+                # Consider unloading only if PIIRedactor instance is done or if memory is critical.
+                # For now, matching previous logic, but _unload_model(unload_all=True) at the end is more robust.
+                self._unload_model(model_idx) 
+{{ ... }}
